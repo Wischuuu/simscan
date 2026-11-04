@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b5fff">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<title>SIM-Scanner</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee;-webkit-tap-highlight-color:transparent}
+header{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:#0b5fff;color:#fff}
+header b{font-size:18px}
+#cnt{font-size:16px}
+#cam{position:relative;background:#000;aspect-ratio:4/3;max-height:45vh;width:100%;overflow:hidden}
+video{width:100%;height:100%;object-fit:cover}
+#frame{position:absolute;left:8%;right:8%;top:38%;height:24%;border:3px solid #fff;border-radius:8px;box-shadow:0 0 0 999px rgba(0,0,0,.45);pointer-events:none}
+#frame.ok{border-color:#2ecc71}#frame.bad{border-color:#e74c3c}
+#status{padding:8px 14px;min-height:40px;font-size:15px;background:#222}
+#status.ok{background:#1e6b3a}#status.bad{background:#7a2323}
+.row{display:flex;gap:8px;padding:8px 14px;flex-wrap:wrap}
+button,label.btn{flex:1;min-width:30%;padding:14px 8px;border:0;border-radius:8px;background:#0b5fff;color:#fff;font-size:16px;text-align:center}
+button.sec,label.btn.sec{background:#444}
+button.red{background:#b3261e}
+button:disabled{opacity:.4}
+#pre{padding:0 14px;font-size:13px;color:#aaa;word-break:break-all}
+input[type=text]{width:100%;padding:12px;font-size:18px;border-radius:8px;border:0;background:#fff;color:#000;font-family:monospace}
+ul{list-style:none;margin:0;padding:0 14px 40px}
+li{display:flex;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid #333;font-family:monospace;font-size:18px}
+li span.n{color:#888;width:36px;font-size:13px}
+li span.v{flex:1}
+li button{flex:none;min-width:0;padding:6px 12px;font-size:14px}
+.chk{display:flex;align-items:center;gap:8px;padding:4px 14px}
+.chk input{width:22px;height:22px}
+</style>
+</head>
+<body>
+<header><b>SIM-Scanner</b><span id="cnt">0 Stück</span></header>
+<div id="cam"><video id="v" playsinline muted autoplay></video><div id="frame"></div></div>
+<div id="status">Starte …</div>
+<div id="pre"></div>
+<div class="chk"><input type="checkbox" id="auto"><label for="auto">Automatisch scannen (Serie)</label></div>
+<div class="row">
+  <button id="scan">Scannen</button>
+  <label class="btn sec">Foto wählen<input type="file" id="file" accept="image/*" capture="environment" hidden></label>
+</div>
+<div class="row">
+  <input type="text" id="manual" placeholder="Manuell: 12345678-9/123" inputmode="text" autocomplete="off">
+  <button class="sec" id="add">Hinzufügen</button>
+</div>
+<div class="row">
+  <button class="sec" id="csv">CSV speichern</button>
+  <button class="sec" id="copy">Kopieren</button>
+  <button class="red" id="clear">Liste leeren</button>
+</div>
+<ul id="list"></ul>
+
+<script src="lib/tesseract.min.js"></script>
+<script>
+"use strict";
+// ===== Format: 8 Ziffern - 1 Ziffer / 3 Ziffern =====
+const PATTERN = /^\d{8}-\d\/\d{3}$/;
+const LOOSE = /(\d{8})\s*[-–—_.]\s*(\d)\s*[\/\\|!]\s*(\d{3})/;
+const KEY = "simscan.list.v1";
+
+const $ = id => document.getElementById(id);
+let list = [];
+try { list = JSON.parse(localStorage.getItem(KEY) || "[]"); } catch (e) {}
+let worker = null, busy = false, stream = null, lastAuto = "", cooldownUntil = 0;
+
+function save() { try { localStorage.setItem(KEY, JSON.stringify(list)); } catch (e) {} }
+function setStatus(t, cls) { const s = $("status"); s.textContent = t; s.className = cls || ""; }
+function flash(cls) { const f = $("frame"); f.className = cls; setTimeout(() => f.className = "", 700); }
+function beep(ok) {
+  try { navigator.vibrate && navigator.vibrate(ok ? 80 : [60, 60, 60]); } catch (e) {}
+  try {
+    const c = new (window.AudioContext || window.webkitAudioContext)();
+    const o = c.createOscillator(), g = c.createGain();
+    o.frequency.value = ok ? 880 : 220; g.gain.value = .15;
+    o.connect(g); g.connect(c.destination); o.start(); o.stop(c.currentTime + (ok ? .1 : .25));
+  } catch (e) {}
+}
+
+// Text aus OCR -> normalisierte Nummer oder null
+function extract(raw) {
+  let t = (raw || "").replace(/[Oo]/g, "0").replace(/[Il|]/g, m => m === "|" ? "/" : "1").replace(/\n/g, " ");
+  let m = t.match(LOOSE);
+  if (m) return `${m[1]}-${m[2]}/${m[3]}`;
+  // Fallback: genau 12 Ziffern ohne lesbare Trennzeichen
+  const d = t.replace(/\D/g, "");
+  if (d.length === 12) return `${d.slice(0, 8)}-${d[8]}/${d.slice(9)}`;
+  return null;
+}
+
+function render() {
+  $("cnt").textContent = list.length + " Stück";
+  const ul = $("list"); ul.innerHTML = "";
+  list.forEach((v, i) => {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="n">${i + 1}</span><span class="v"></span>`;
+    li.querySelector(".v").textContent = v;
+    const b = document.createElement("button"); b.className = "red"; b.textContent = "✕";
+    b.onclick = () => { list.splice(i, 1); save(); render(); };
+    li.appendChild(b); ul.appendChild(li);
+  });
+}
+
+function addValue(v, src) {
+  if (!PATTERN.test(v)) { setStatus("Ungültig: " + v, "bad"); flash("bad"); beep(false); return false; }
+  if (list.includes(v)) { setStatus("Doppelt, nicht hinzugefügt: " + v, "bad"); flash("bad"); beep(false); return false; }
+  list.unshift(v); save(); render();
+  setStatus("OK: " + v + " (" + list.length + ")", "ok"); flash("ok"); beep(true);
+  return true;
+}
+
+// ===== OCR =====
+async function initOcr() {
+  setStatus("Lade OCR …");
+  worker = await Tesseract.createWorker("eng", 1, {
+    workerPath: "lib/worker.min.js",
+    corePath: "lib/",
+    langPath: "lang/",
+    gzip: true,
+    workerBlobURL: false
+  });
+  await worker.setParameters({
+    tessedit_char_whitelist: "0123456789-/",
+    tessedit_pageseg_mode: "7",          // eine Textzeile
+    user_defined_dpi: "300"
+  });
+}
+
+function preprocess(src, sw, sh, sx, sy, cw, ch) {
+  const scale = Math.min(2.5, 1400 / cw);
+  const c = document.createElement("canvas");
+  c.width = Math.round(cw * scale); c.height = Math.round(ch * scale);
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.drawImage(src, sx, sy, cw, ch, 0, 0, c.width, c.height);
+  const d = x.getImageData(0, 0, c.width, c.height), p = d.data;
+  let lo = 255, hi = 0;
+  const g = new Uint8Array(p.length / 4);
+  for (let i = 0, j = 0; i < p.length; i += 4, j++) {
+    const y = (p[i] * .299 + p[i + 1] * .587 + p[i + 2] * .114) | 0;
+    g[j] = y; if (y < lo) lo = y; if (y > hi) hi = y;
+  }
+  const r = Math.max(1, hi - lo);
+  let sum = 0;
+  for (let j = 0; j < g.length; j++) { g[j] = ((g[j] - lo) * 255) / r; sum += g[j]; }
+  const mean = sum / g.length;
+  // Schrift immer dunkel auf hell: bei dunklem Hintergrund invertieren
+  const inv = mean < 110;
+  for (let i = 0, j = 0; i < p.length; i += 4, j++) {
+    const v = inv ? 255 - g[j] : g[j];
+    p[i] = p[i + 1] = p[i + 2] = v; p[i + 3] = 255;
+  }
+  x.putImageData(d, 0, 0);
+  return c;
+}
+
+async function recognize(canvas) {
+  const { data } = await worker.recognize(canvas);
+  return data.text || "";
+}
+
+async function scanSource(src, w, h, fullImage) {
+  if (busy || !worker) return;
+  busy = true;
+  try {
+    let box;
+    if (fullImage) box = [0, 0, w, h];
+    else box = [w * .08, h * .38, w * .84, h * .24];
+    const tries = [box];
+    if (fullImage) tries.push([0, h * .25, w, h * .5]);
+    for (const b of tries) {
+      const cv = preprocess(src, w, h, b[0], b[1], b[2], b[3]);
+      const raw = await recognize(cv);
+      $("pre").textContent = "OCR: " + raw.trim().replace(/\n/g, " ⏎ ");
+      const v = extract(raw);
+      if (v) return v;
+    }
+    return null;
+  } finally { busy = false; }
+}
+
+async function doScan(auto) {
+  const vid = $("v");
+  if (!vid.videoWidth) { setStatus("Kamera nicht bereit", "bad"); return; }
+  const v = await scanSource(vid, vid.videoWidth, vid.videoHeight, false);
+  if (v) {
+    if (auto && v === lastAuto) return;
+    lastAuto = v; addValue(v, "cam");
+    if (auto) cooldownUntil = Date.now() + 1500;
+  } else if (!auto) { setStatus("Nichts erkannt. Näher ran, Licht prüfen, Nummer im Rahmen.", "bad"); flash("bad"); beep(false); }
+}
+
+async function autoLoop() {
+  while (true) {
+    if ($("auto").checked && worker && !busy && Date.now() > cooldownUntil) {
+      try { await doScan(true); } catch (e) {}
+    }
+    await new Promise(r => setTimeout(r, 400));
+  }
+}
+
+async function startCam() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+    });
+    $("v").srcObject = stream;
+    // Autofokus, falls unterstützt
+    const tr = stream.getVideoTracks()[0], caps = tr.getCapabilities ? tr.getCapabilities() : {};
+    if (caps.focusMode && caps.focusMode.includes("continuous")) tr.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(() => {});
+  } catch (e) {
+    $("cam").style.display = "none"; $("scan").disabled = true; $("auto").disabled = true;
+    setStatus("Keine Kamera-Freigabe. Nutze „Foto wählen“ oder Handeingabe.", "bad");
+  }
+}
+
+// ===== UI =====
+$("scan").onclick = () => doScan(false);
+$("add").onclick = () => {
+  const raw = $("manual").value.trim();
+  const v = extract(raw) || raw;
+  if (addValue(v, "manual")) $("manual").value = "";
+};
+$("manual").addEventListener("keydown", e => { if (e.key === "Enter") $("add").click(); });
+$("file").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  if (!worker) { setStatus("OCR lädt noch …"); return; }
+  setStatus("Lese Foto …");
+  const bmp = await createImageBitmap(f);
+  const v = await scanSource(bmp, bmp.width, bmp.height, true);
+  if (v) addValue(v, "file"); else { setStatus("Nichts erkannt.", "bad"); beep(false); }
+  e.target.value = "";
+};
+$("csv").onclick = () => {
+  const rows = ["Nr;SIM-Nummer"].concat(list.slice().reverse().map((v, i) => `${i + 1};"${v}"`));
+  const blob = new Blob(["﻿" + rows.join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = "sim-liste-" + new Date().toISOString().slice(0, 10) + ".csv"; a.click();
+};
+$("copy").onclick = async () => {
+  const t = list.slice().reverse().join("\n");
+  try { await navigator.clipboard.writeText(t); setStatus("Kopiert (" + list.length + ")", "ok"); }
+  catch (e) { setStatus("Kopieren nicht möglich", "bad"); }
+};
+$("clear").onclick = () => { if (list.length && confirm("Liste mit " + list.length + " Einträgen wirklich leeren?")) { list = []; save(); render(); } };
+
+(async () => {
+  render();
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+  startCam();
+  try { await initOcr(); setStatus("Bereit. Nummer in den Rahmen halten.", ""); autoLoop(); window.__ready = true; }
+  catch (e) { setStatus("OCR-Fehler: " + e.message, "bad"); }
+})();
+window.__test = { extract, get list() { return list; } };
+</script>
+</body>
+</html>
