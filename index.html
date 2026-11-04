@@ -15,7 +15,7 @@ header b{font-size:18px}
 #cnt{font-size:16px}
 #cam{position:relative;background:#000;aspect-ratio:4/3;max-height:45vh;width:100%;overflow:hidden}
 video{width:100%;height:100%;object-fit:cover}
-#frame{position:absolute;left:8%;right:8%;top:38%;height:24%;border:3px solid #fff;border-radius:8px;box-shadow:0 0 0 999px rgba(0,0,0,.45);pointer-events:none}
+#frame{position:absolute;left:5%;right:5%;top:39%;height:22%;border:3px solid #fff;border-radius:8px;box-shadow:0 0 0 999px rgba(0,0,0,.45);pointer-events:none}
 #frame.ok{border-color:#2ecc71}#frame.bad{border-color:#e74c3c}
 #status{padding:8px 14px;min-height:40px;font-size:15px;background:#222}
 #status.ok{background:#1e6b3a}#status.bad{background:#7a2323}
@@ -61,7 +61,7 @@ li button{flex:none;min-width:0;padding:6px 12px;font-size:14px}
 "use strict";
 // ===== Format: 8 Ziffern - 1 Ziffer / 3 Ziffern =====
 const PATTERN = /^\d{8}-\d\/\d{3}$/;
-const LOOSE = /(\d{8})\s*[-–—_.]\s*(\d)\s*[\/\\|!]\s*(\d{3})/;
+const LOOSE = /(\d{8})[^\d]{0,3}(\d)[^\d]{0,3}(\d{3})(?!\d)/;
 const KEY = "simscan.list.v1";
 
 const $ = id => document.getElementById(id);
@@ -131,8 +131,9 @@ async function initOcr() {
   });
 }
 
-function preprocess(src, sw, sh, sx, sy, cw, ch) {
-  const scale = Math.min(2.5, 1400 / cw);
+function preprocess(src, sw, sh, sx, sy, cw, ch, mode) {
+  const otsu = mode === 1;
+  const scale = Math.min(window.MAXSC || 3, (window.MAXW || 2800) / cw);
   const c = document.createElement("canvas");
   c.width = Math.round(cw * scale); c.height = Math.round(ch * scale);
   const x = c.getContext("2d", { willReadFrequently: true });
@@ -149,9 +150,22 @@ function preprocess(src, sw, sh, sx, sy, cw, ch) {
   for (let j = 0; j < g.length; j++) { g[j] = ((g[j] - lo) * 255) / r; sum += g[j]; }
   const mean = sum / g.length;
   // Schrift immer dunkel auf hell: bei dunklem Hintergrund invertieren
-  const inv = mean < 110;
+  const inv = mode === 2;
+  let th = 128;
+  if (otsu) {
+    const h = new Array(256).fill(0);
+    for (let j = 0; j < g.length; j++) h[inv ? 255 - (g[j] | 0) : (g[j] | 0)]++;
+    let tot = g.length, sumAll = 0; for (let k = 0; k < 256; k++) sumAll += k * h[k];
+    let wB = 0, sB = 0, best = 0;
+    for (let k = 0; k < 256; k++) {
+      wB += h[k]; if (!wB) continue; const wF = tot - wB; if (!wF) break;
+      sB += k * h[k]; const mB = sB / wB, mF = (sumAll - sB) / wF;
+      const bt = wB * wF * (mB - mF) * (mB - mF); if (bt > best) { best = bt; th = k; }
+    }
+  }
   for (let i = 0, j = 0; i < p.length; i += 4, j++) {
-    const v = inv ? 255 - g[j] : g[j];
+    let v = inv ? 255 - g[j] : g[j];
+    if (otsu) v = v > th ? 255 : 0;
     p[i] = p[i + 1] = p[i + 2] = v; p[i + 3] = 255;
   }
   x.putImageData(d, 0, 0);
@@ -163,35 +177,76 @@ async function recognize(canvas) {
   return data.text || "";
 }
 
-async function scanSource(src, w, h, fullImage) {
-  if (busy || !worker) return;
+async function ocrTry(src, sw, sh, box, mode, psm) {
+  await worker.setParameters({ tessedit_pageseg_mode: psm });
+  const cv = preprocess(src, sw, sh, box[0], box[1], box[2], box[3], mode);
+  const raw = await recognize(cv);
+  $("pre").textContent = "OCR: " + raw.trim().replace(/\n/g, " ⏎ ");
+  return extract(raw);
+}
+
+function best(c) {
+  let bv = null, bn = 0;
+  for (const k in c) if (c[k] > bn) { bn = c[k]; bv = k; }
+  return { value: bv, votes: bn };
+}
+
+// geo = {frame:[x,y,w,h], region:[x,y,w,h]}; Ergebnis: {value, votes}
+async function scanSource(src, sw, sh, geo, deep) {
+  if (busy || !worker) return { value: null, votes: 0 };
   busy = true;
+  const c = {};
+  const vote = v => { if (v) c[v] = (c[v] || 0) + 1; };
   try {
-    let box;
-    if (fullImage) box = [0, 0, w, h];
-    else box = [w * .08, h * .38, w * .84, h * .24];
-    const tries = [box];
-    if (fullImage) tries.push([0, h * .25, w, h * .5]);
-    for (const b of tries) {
-      const cv = preprocess(src, w, h, b[0], b[1], b[2], b[3]);
-      const raw = await recognize(cv);
-      $("pre").textContent = "OCR: " + raw.trim().replace(/\n/g, " ⏎ ");
-      const v = extract(raw);
-      if (v) return v;
+    vote(await ocrTry(src, sw, sh, geo.frame, 0, "7"));
+    vote(await ocrTry(src, sw, sh, geo.frame, 1, "7"));
+    let r = best(c); if (r.votes >= 2 || !deep) return r;
+    vote(await ocrTry(src, sw, sh, geo.frame, 2, "7"));
+    r = best(c); if (r.votes >= 2) return r;
+    // Fallback: Streifen über den größeren Bereich
+    const R = geo.region, H = R[3] * 0.22, step = H / 2;
+    for (const mode of [0, 1, 2]) {
+      for (let y = R[1]; y + H <= R[1] + R[3] + 1; y += step) {
+        vote(await ocrTry(src, sw, sh, [R[0], y, R[2], H], mode, "7"));
+        r = best(c); if (r.votes >= 2) return r;
+      }
     }
-    return null;
+    return best(c);
   } finally { busy = false; }
 }
 
+// Geometrie im Videobild (object-fit: cover berücksichtigen)
+function videoGeo(vid) {
+  const c = $("cam"), cw = c.clientWidth, ch = c.clientHeight, vw = vid.videoWidth, vh = vid.videoHeight;
+  const sc = Math.max(cw / vw, ch / vh);
+  const ox = (vw * sc - cw) / 2, oy = (vh * sc - ch) / 2;
+  const toV = (x, y, w, h) => [(x + ox) / sc, (y + oy) / sc, w / sc, h / sc];
+  return { frame: toV(cw * .05, ch * .39, cw * .90, ch * .22), region: toV(0, ch * .22, cw, ch * .56) };
+}
+
+let pendingAuto = null;
 async function doScan(auto) {
   const vid = $("v");
   if (!vid.videoWidth) { setStatus("Kamera nicht bereit", "bad"); return; }
-  const v = await scanSource(vid, vid.videoWidth, vid.videoHeight, false);
-  if (v) {
-    if (auto && v === lastAuto) return;
-    lastAuto = v; addValue(v, "cam");
-    if (auto) cooldownUntil = Date.now() + 1500;
-  } else if (!auto) { setStatus("Nichts erkannt. Näher ran, Licht prüfen, Nummer im Rahmen.", "bad"); flash("bad"); beep(false); }
+  if (!auto) setStatus("Lese …");
+  const r = await scanSource(vid, vid.videoWidth, vid.videoHeight, videoGeo(vid), !auto);
+  handleResult(r, auto);
+}
+
+function handleResult(r, auto) {
+  const v = r.value;
+  if (auto) {
+    if (!v) { pendingAuto = null; return; }
+    if (r.votes >= 2 || v === pendingAuto) {
+      pendingAuto = null;
+      if (v === lastAuto) return;
+      lastAuto = v; addValue(v, "cam"); cooldownUntil = Date.now() + 1500;
+    } else pendingAuto = v;
+    return;
+  }
+  if (!v) { setStatus("Nichts erkannt. Näher ran, Nummer breit in den Rahmen, Licht prüfen.", "bad"); flash("bad"); beep(false); return; }
+  if (r.votes >= 2) { lastAuto = v; addValue(v, "cam"); }
+  else { $("manual").value = v; setStatus("Unsicher: " + v + " – bitte prüfen, korrigieren und „Hinzufügen“.", "bad"); flash("bad"); beep(false); }
 }
 
 async function autoLoop() {
@@ -231,8 +286,11 @@ $("file").onchange = async e => {
   if (!worker) { setStatus("OCR lädt noch …"); return; }
   setStatus("Lese Foto …");
   const bmp = await createImageBitmap(f);
-  const v = await scanSource(bmp, bmp.width, bmp.height, true);
-  if (v) addValue(v, "file"); else { setStatus("Nichts erkannt.", "bad"); beep(false); }
+  const W = bmp.width, H = bmp.height;
+  const r = await scanSource(bmp, W, H, { frame: [0, H * .3, W, H * .4], region: [0, 0, W, H] }, true);
+  if (r.value && r.votes >= 2) addValue(r.value, "file");
+  else if (r.value) { $("manual").value = r.value; setStatus("Unsicher: " + r.value + " – bitte prüfen.", "bad"); }
+  else { setStatus("Nichts erkannt.", "bad"); beep(false); }
   e.target.value = "";
 };
 $("csv").onclick = () => {
