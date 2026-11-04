@@ -1,4 +1,4 @@
-const V = "simscan-v4";
+const V = "simscan-v5";
 const FILES = ["./", "index.html", "manifest.json", "icon-192.png", "icon-512.png",
   "lib/tesseract.min.js", "lib/worker.min.js",
   "lib/tesseract-core-simd-lstm.wasm.js", "lib/tesseract-core-lstm.wasm.js",
