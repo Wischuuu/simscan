@@ -13,9 +13,9 @@ body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee;-webki
 header{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:#0b5fff;color:#fff}
 header b{font-size:18px}
 #cnt{font-size:16px}
-#cam{position:relative;background:#000;aspect-ratio:4/3;max-height:45vh;width:100%;overflow:hidden}
+#cam{position:relative;background:#000;aspect-ratio:1/1;max-height:52vh;width:100%;overflow:hidden}
 video{width:100%;height:100%;object-fit:cover}
-#frame{position:absolute;left:5%;right:5%;top:39%;height:22%;border:3px solid #fff;border-radius:8px;box-shadow:0 0 0 999px rgba(0,0,0,.45);pointer-events:none}
+#frame{position:absolute;left:15%;top:15%;width:70%;height:70%;border:3px solid #fff;border-radius:8px;box-shadow:0 0 0 999px rgba(0,0,0,.45);pointer-events:none}
 #frame.ok{border-color:#2ecc71}#frame.bad{border-color:#e74c3c}
 #status{padding:8px 14px;min-height:40px;font-size:15px;background:#222}
 #status.ok{background:#1e6b3a}#status.bad{background:#7a2323}
@@ -61,7 +61,8 @@ li button{flex:none;min-width:0;padding:6px 12px;font-size:14px}
 "use strict";
 // ===== Format: 8 Ziffern - 1 Ziffer / 3 Ziffern =====
 const PATTERN = /^\d{8}-\d\/\d{3}$/;
-const LOOSE = /(\d{8})[^\d]{0,3}(\d)[^\d]{0,3}(\d{3})(?!\d)/;
+const LOOSE = /(?<!\d)(\d{8})[^\d\n]{0,3}(\d)[^\d\n]{0,3}(\d{3})(?!\d)/;
+const STRICT = /(?<!\d)(\d{8})\s?[-–—]\s?(\d)\s?[\/\\|]\s?(\d{3})/;
 const KEY = "simscan.list.v1";
 
 const $ = id => document.getElementById(id);
@@ -82,14 +83,18 @@ function beep(ok) {
   } catch (e) {}
 }
 
-// Text aus OCR -> normalisierte Nummer oder null
+// Text aus OCR -> normalisierte Nummer oder null (nur die Nummernzeile zählt, Rest wird ignoriert)
+function norm(t) { return t.replace(/[Oo]/g, "0").replace(/[Il|]/g, m => m === "|" ? "/" : "1"); }
+function fmt(m) { return `${m[1]}-${m[2]}/${m[3]}`; }
 function extract(raw) {
-  let t = (raw || "").replace(/[Oo]/g, "0").replace(/[Il|]/g, m => m === "|" ? "/" : "1").replace(/\n/g, " ");
-  let m = t.match(LOOSE);
-  if (m) return `${m[1]}-${m[2]}/${m[3]}`;
-  // Fallback: genau 12 Ziffern ohne lesbare Trennzeichen
-  const d = t.replace(/\D/g, "");
-  if (d.length === 12) return `${d.slice(0, 8)}-${d[8]}/${d.slice(9)}`;
+  const lines = (raw || "").split(/\n/).map(norm);
+  for (const ln of lines) { const m = ln.match(STRICT); if (m) return fmt(m); }   // Trennzeichen erkannt: Zeichen dahinter egal
+  for (const ln of lines) { const m = ln.match(LOOSE); if (m) return fmt(m); }
+  const m = lines.join(" ").match(LOOSE); if (m) return fmt(m);
+  for (const ln of lines) {                       // Zeile mit genau 12 Ziffern, Trennzeichen unlesbar
+    const d = ln.replace(/\D/g, "");
+    if (d.length === 12) return `${d.slice(0, 8)}-${d[8]}/${d.slice(9)}`;
+  }
   return null;
 }
 
@@ -126,7 +131,7 @@ async function initOcr() {
   });
   await worker.setParameters({
     tessedit_char_whitelist: "0123456789-/",
-    tessedit_pageseg_mode: "7",          // eine Textzeile
+    tessedit_pageseg_mode: "6",
     user_defined_dpi: "300"
   });
 }
@@ -191,23 +196,58 @@ function best(c) {
   return { value: bv, votes: bn };
 }
 
-// geo = {frame:[x,y,w,h], region:[x,y,w,h]}; Ergebnis: {value, votes}
+// Zeilen mit Ziffern finden (aus Wort-Boxen), damit jede Zeile einzeln und sauber gelesen werden kann
+function rowBoxes(data) {
+  const rows = [];
+  for (const w of data.words || []) {
+    const dg = (w.text.match(/\d/g) || []).length;
+    if (dg < 5 || !w.bbox) continue;
+    const y0 = w.bbox.y0, y1 = w.bbox.y1, cy = (y0 + y1) / 2, h = y1 - y0;
+    const r = rows.find(r => Math.abs(cy - (r.y0 + r.y1) / 2) < 0.6 * Math.max(h, r.y1 - r.y0));
+    if (r) { r.y0 = Math.min(r.y0, y0); r.y1 = Math.max(r.y1, y1); r.dg += dg; }
+    else rows.push({ y0, y1, dg });
+  }
+  return rows.sort((a, b) => b.dg - a.dg).slice(0, 3);
+}
+
+async function viaRows(cv, vote) {
+  await worker.setParameters({ tessedit_pageseg_mode: "11" });
+  const { data } = await worker.recognize(cv);
+  $("pre").textContent = "OCR: " + (data.text || "").trim().replace(/\n+/g, " ⏎ ");
+  vote(extract(data.text));
+  for (const r of rowBoxes(data)) {
+    const h = r.y1 - r.y0, y = Math.max(0, r.y0 - h * 0.5), hh = Math.min(cv.height - y, h * 2);
+    const c = document.createElement("canvas"); c.width = cv.width; c.height = Math.round(hh);
+    c.getContext("2d").drawImage(cv, 0, y, cv.width, hh, 0, 0, c.width, c.height);
+    await worker.setParameters({ tessedit_pageseg_mode: "7" });
+    const t = (await worker.recognize(c)).data.text || "";
+    $("pre").textContent = "OCR: " + t.trim();
+    vote(extract(t));
+  }
+}
+
+// geo = {frame:[x,y,w,h]}; Ergebnis: {value, votes}
 async function scanSource(src, sw, sh, geo, deep) {
   if (busy || !worker) return { value: null, votes: 0 };
   busy = true;
   const c = {};
   const vote = v => { if (v) c[v] = (c[v] || 0) + 1; };
+  const F = geo.frame;
   try {
-    vote(await ocrTry(src, sw, sh, geo.frame, 0, "7"));
-    vote(await ocrTry(src, sw, sh, geo.frame, 1, "7"));
-    let r = best(c); if (r.votes >= 2 || !deep) return r;
-    vote(await ocrTry(src, sw, sh, geo.frame, 2, "7"));
-    r = best(c); if (r.votes >= 2) return r;
-    // Fallback: Streifen über den größeren Bereich
-    const R = geo.region, H = R[3] * 0.22, step = H / 2;
-    for (const mode of [0, 1, 2]) {
-      for (let y = R[1]; y + H <= R[1] + R[3] + 1; y += step) {
-        vote(await ocrTry(src, sw, sh, [R[0], y, R[2], H], mode, "7"));
+    const mk = mode => preprocess(src, sw, sh, F[0], F[1], F[2], F[3], mode);
+    await viaRows(mk(0), vote);
+    let r = best(c); if (r.votes >= 2) return r;
+    await viaRows(mk(1), vote);
+    r = best(c); if (r.votes >= 2 || !deep) return r;
+    for (const psm of ["4", "3", "6"]) {
+      vote(await ocrTry(src, sw, sh, F, 0, psm));
+      r = best(c); if (r.votes >= 2) return r;
+    }
+    // Fallback: Streifen über den Rahmen, jeweils eine Zeile
+    const H = F[3] * 0.2, step = H / 2;
+    for (const mode of [0, 1]) {
+      for (let y = F[1]; y + H <= F[1] + F[3] + 1; y += step) {
+        vote(await ocrTry(src, sw, sh, [F[0], y, F[2], H], mode, "7"));
         r = best(c); if (r.votes >= 2) return r;
       }
     }
@@ -215,20 +255,36 @@ async function scanSource(src, sw, sh, geo, deep) {
   } finally { busy = false; }
 }
 
-// Geometrie im Videobild (object-fit: cover berücksichtigen)
+// Rahmen im Videobild (object-fit: cover berücksichtigen)
+function layoutFrame() {
+  const c = $("cam"), cw = c.clientWidth, ch = c.clientHeight, side = Math.min(cw, ch) * 0.72;
+  const f = $("frame");
+  f.style.width = f.style.height = side + "px";
+  f.style.left = (cw - side) / 2 + "px"; f.style.top = (ch - side) / 2 + "px";
+  return { cw, ch, side };
+}
 function videoGeo(vid) {
-  const c = $("cam"), cw = c.clientWidth, ch = c.clientHeight, vw = vid.videoWidth, vh = vid.videoHeight;
+  const { cw, ch, side } = layoutFrame(), vw = vid.videoWidth, vh = vid.videoHeight;
   const sc = Math.max(cw / vw, ch / vh);
   const ox = (vw * sc - cw) / 2, oy = (vh * sc - ch) / 2;
   const toV = (x, y, w, h) => [(x + ox) / sc, (y + oy) / sc, w / sc, h / sc];
-  return { frame: toV(cw * .05, ch * .39, cw * .90, ch * .22), region: toV(0, ch * .22, cw, ch * .56) };
+  return { frame: toV((cw - side) / 2, (ch - side) / 2, side, side) };
 }
 
 let pendingAuto = null;
 async function doScan(auto) {
   const vid = $("v");
   if (!vid.videoWidth) { setStatus("Kamera nicht bereit", "bad"); return; }
-  if (!auto) setStatus("Lese …");
+  if (!auto) {
+    setStatus("Lese …");
+    try {   // einmal scharfstellen lassen
+      const tr = stream && stream.getVideoTracks()[0], caps = tr && tr.getCapabilities ? tr.getCapabilities() : {};
+      if (caps.focusMode && caps.focusMode.includes("single-shot")) {
+        await tr.applyConstraints({ advanced: [{ focusMode: "single-shot" }] });
+        await new Promise(r => setTimeout(r, 500));
+      }
+    } catch (e) {}
+  }
   const r = await scanSource(vid, vid.videoWidth, vid.videoHeight, videoGeo(vid), !auto);
   handleResult(r, auto);
 }
@@ -287,7 +343,7 @@ $("file").onchange = async e => {
   setStatus("Lese Foto …");
   const bmp = await createImageBitmap(f);
   const W = bmp.width, H = bmp.height;
-  const r = await scanSource(bmp, W, H, { frame: [0, H * .3, W, H * .4], region: [0, 0, W, H] }, true);
+  const r = await scanSource(bmp, W, H, { frame: [0, 0, W, H] }, true);
   if (r.value && r.votes >= 2) addValue(r.value, "file");
   else if (r.value) { $("manual").value = r.value; setStatus("Unsicher: " + r.value + " – bitte prüfen.", "bad"); }
   else { setStatus("Nichts erkannt.", "bad"); beep(false); }
@@ -306,11 +362,12 @@ $("copy").onclick = async () => {
 };
 $("clear").onclick = () => { if (list.length && confirm("Liste mit " + list.length + " Einträgen wirklich leeren?")) { list = []; save(); render(); } };
 
+window.addEventListener("resize", layoutFrame);
 (async () => {
-  render();
+  render(); layoutFrame();
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
   startCam();
-  try { await initOcr(); setStatus("Bereit. Nummer in den Rahmen halten.", ""); autoLoop(); window.__ready = true; }
+  try { await initOcr(); setStatus("Bereit. SIM-Label (Nummer) in den Rahmen legen.", ""); autoLoop(); window.__ready = true; }
   catch (e) { setStatus("OCR-Fehler: " + e.message, "bad"); }
 })();
 window.__test = { extract, get list() { return list; } };
